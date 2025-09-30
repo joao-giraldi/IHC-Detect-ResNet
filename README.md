@@ -108,27 +108,27 @@ Figuras: totais por classe, histograma da taxa positiva, F1 por classe e Precis�
 
 ## 🔧 Principais configs (onde mexer)
 
--Treino: `EPOCHS`, `BATCH_SIZE`, `LR`, `LR_STEP_SIZE/LR_GAMMA` (ou `Cosine`), `MIN_SIZE/MAX_SIZE` (ou lista para multi-scale), `SEED`, `NUM_WORKERS`.
--Contagem: `SCORE_THR` (sensibilidade vs. falsos positivos), `METRICS.IOU_THR` (acerto por IoU), `GT_MODE` (coco ou yolo).
--Overlays: cores já mapeadas (neg=verde, pos=vermelho, incerta=amarelo).
+- Treino: `EPOCHS`, `BATCH_SIZE`, `LR`, `LR_STEP_SIZE/LR_GAMMA` (ou `Cosine`), `MIN_SIZE/MAX_SIZE` (ou lista para multi-scale), `SEED`, `NUM_WORKERS`.
+- Contagem: `SCORE_THR` (sensibilidade vs. falsos positivos), `METRICS.IOU_THR` (acerto por IoU), `GT_MODE` (coco ou yolo).
+- Overlays: cores já mapeadas (neg=verde, pos=vermelho, incerta=amarelo).
 
 ---
 
 ## 📊 O que significam as métricas
 
--mAP COCO: AP geral (0.50:0.95), AP50, AP75, AR.
--Precisão (P) = TP / (TP + FP).
--Recall (R) = TP / (TP + FN).
--F1 = 2PR / (P + R).
+- mAP COCO: AP geral (0.50:0.95), AP50, AP75, AR.
+- Precisão (P) = TP / (TP + FP).
+- Recall (R) = TP / (TP + FN).
+- F1 = 2PR / (P + R).
 >Todas dependem do SCORE_THR (confiança) e do IOU_THR configurados.
 
 ---
 
 ## 🛠️ Solução de problemas
 
--cuda available: False: instale o PyTorch com CUDA cu121 (comando acima) e verifique `nvidia-smi`.
--OOM (memória): reduza `MIN_SIZE/MAX_SIZE` (ex.: 800/1333) ou `BATCH_SIZE=1`.
--GPU ociosa: aumente `NUM_WORKERS` (8–12 no i7-12700F) e use `persistent_workers=True`.
+- cuda available: False: instale o PyTorch com CUDA cu121 (comando acima) e verifique `nvidia-smi`.
+- OOM (memória): reduza `MIN_SIZE/MAX_SIZE` (ex.: 800/1333) ou `BATCH_SIZE=1`.
+- GPU ociosa: aumente `NUM_WORKERS` (8–12 no i7-12700F) e use `persistent_workers=True`.
 
 ---
 
