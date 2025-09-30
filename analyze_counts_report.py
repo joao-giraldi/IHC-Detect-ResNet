@@ -3,6 +3,8 @@ Lê o CSV de contagens gerado pelo detector e produz:
 1) Um CSV "enriquecido" com TOTAL por imagem e % por classe (taxas).
 2) Um relatório Markdown com estatísticas gerais, TOP-N e **métricas agregadas** (P/R/F1).
 3) Gráficos: totais por classe, histograma da taxa positiva, **F1 por classe**.
+4) Relatório de Precisão/Métricas com **TP/FP/FN/TN, Precisão, Recall, F1, IoU, Accuracy, Specificity**.
+   (TN/Accuracy/Specificity só são computados se `tn_*`/`tn_all` existirem no CSV ou se houver coluna global de TN.)
 
 Requisitos: pandas, matplotlib
     pip install pandas matplotlib
@@ -22,9 +24,33 @@ POS_NAMES = {"positive", "pos", "positivo", "positiva"}
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-METRIC_PREFIXES = ("tp_", "fp_", "fn_", "prec_", "rec_", "f1_")
-GLOBAL_METRICS = {"tp_all", "fp_all", "fn_all", "prec_all", "rec_all", "f1_all"}
+METRIC_PREFIXES = ("tp_", "fp_", "fn_", "tn_", "prec_", "rec_", "f1_", "iou_")
+GLOBAL_METRICS = {
+    "tp_all", "fp_all", "fn_all", "tn_all",
+    "prec_all", "rec_all", "f1_all", "iou_all", "acc_all", "spec_all"
+}
 
+# --------- helpers de formatação para MD ----------
+def _percentify(df, cols):
+    df = df.copy()
+    for col in cols:
+        if col in df.columns:
+            df[col] = (df[col] * 100).round(2)
+    return df
+
+def _drop_all_nan_cols(df, preserve=None):
+    preserve = set(preserve or [])
+    keep = []
+    for c in df.columns:
+        if c in preserve:
+            keep.append(c)
+        else:
+            s = df[c]
+            if not (getattr(s, "isna", None) and s.isna().all()):
+                keep.append(c)
+    return df[keep]
+
+# -------------------------------------------------
 
 def _find_image_col(cols):
     for c in cols:
@@ -32,11 +58,9 @@ def _find_image_col(cols):
             return c
     return cols[0]
 
-
 def _is_metric_col(col: str) -> bool:
     c = str(col).strip().lower()
     return c in GLOBAL_METRICS or any(c.startswith(p) for p in METRIC_PREFIXES)
-
 
 def _candidate_class_cols(df, img_col):
     out = []
@@ -53,34 +77,32 @@ def _candidate_class_cols(df, img_col):
         out.append(c)
     return out
 
-
 def _discover_metric_classes(cols):
     """
     Descobre nomes de classes presentes nas métricas a partir de colunas como:
-    tp_positive, fp_negative, f1_uncertain...
+    tp_positive, fp_negative, f1_uncertain, tn_background...
+    Ignora sufixos agregados como *_all, *_micro, *_global.
     """
     names = set()
     for c in cols:
         c = str(c).strip()
         for pref in METRIC_PREFIXES:
             if c.startswith(pref):
-                names.add(c[len(pref) :])
+                suffix = c[len(pref):]
+                if suffix.lower() in {"all", "micro", "global"}:
+                    break
+                names.add(suffix)
                 break
     return sorted(names)
-
 
 def load_counts(path):
     df = pd.read_csv(path)
     img_col = _find_image_col(df.columns)
-
     class_cols = _candidate_class_cols(df, img_col)
-
     for c in class_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-
     metric_class_names = _discover_metric_classes(df.columns)
     return df, img_col, class_cols, metric_class_names
-
 
 def enrich(df, img_col, class_cols):
     out = df.copy()
@@ -88,7 +110,6 @@ def enrich(df, img_col, class_cols):
     for c in class_cols:
         out[f"rate_{c}"] = np.where(out["TOTAL"] > 0, out[c] / out["TOTAL"], 0.0)
     return out
-
 
 def summarize(df_en, img_col, class_cols):
     totals = {c: int(df_en[c].sum()) for c in class_cols}
@@ -116,85 +137,109 @@ def summarize(df_en, img_col, class_cols):
         "stats_total": stats_total,
     }
 
+def _safe_sum(series_like):
+    return pd.to_numeric(series_like, errors="coerce").fillna(0).sum()
 
 def aggregate_metrics(df, metric_class_names):
-    """
-    Agrega métricas por classe a partir de tp_*, fp_*, fn_* nas linhas.
-    Se houver colunas *_all, usa também para micro (senão soma tudo).
-    Retorna dois DataFrames:
-      - per_class_df: index=classe, cols=[TP,FP,FN,P,R,F1]
-      - micro_df: uma linha com TP/FP/FN/P/R/F1
-    """
+
     if not metric_class_names:
         return None, None
 
-    # soma tp/fp/fn por classe (se a coluna não existir, trata como zero)
-    records = []
+    per_class_records = []
     for cname in metric_class_names:
-        tp = pd.to_numeric(df.get(f"tp_{cname}", 0), errors="coerce").fillna(0).sum()
-        fp = pd.to_numeric(df.get(f"fp_{cname}", 0), errors="coerce").fillna(0).sum()
-        fn = pd.to_numeric(df.get(f"fn_{cname}", 0), errors="coerce").fillna(0).sum()
+        tp = _safe_sum(df.get(f"tp_{cname}", 0))
+        fp = _safe_sum(df.get(f"fp_{cname}", 0))
+        fn = _safe_sum(df.get(f"fn_{cname}", 0))
+        tn_series = df.get(f"tn_{cname}", None)
+        tn = _safe_sum(tn_series) if tn_series is not None else None
+
         p = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
         r = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
         f1 = (2 * p * r / (p + r)) if (p + r) > 0 else 0.0
-        records.append(
+        iou = (tp / (tp + fp + fn)) if (tp + fp + fn) > 0 else 0.0
+
+        if tn is not None and (tp + fp + fn + tn) > 0:
+            acc = (tp + tn) / (tp + fp + fn + tn)
+            spec = (tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+        else:
+            acc = np.nan
+            spec = np.nan
+
+        per_class_records.append(
             {
                 "classe": cname,
                 "TP": int(tp),
                 "FP": int(fp),
                 "FN": int(fn),
+                "TN": (int(tn) if tn is not None else np.nan),
                 "Precisao": p,
                 "Recall": r,
                 "F1": f1,
+                "IoU": iou,
+                "Accuracy": acc,
+                "Specificity": spec,
             }
         )
-    per_class_df = pd.DataFrame(records).sort_values("F1", ascending=False)
 
+    per_class_df = pd.DataFrame(per_class_records)
+
+    # ---- MICRO (global) ----
     if all(col in df.columns for col in ["tp_all", "fp_all", "fn_all"]):
-        tp_all = pd.to_numeric(df["tp_all"], errors="coerce").fillna(0).sum()
-        fp_all = pd.to_numeric(df["fp_all"], errors="coerce").fillna(0).sum()
-        fn_all = pd.to_numeric(df["fn_all"], errors="coerce").fillna(0).sum()
+        tp_all = _safe_sum(df["tp_all"])
+        fp_all = _safe_sum(df["fp_all"])
+        fn_all = _safe_sum(df["fn_all"])
     else:
         tp_all = per_class_df["TP"].sum()
         fp_all = per_class_df["FP"].sum()
         fn_all = per_class_df["FN"].sum()
+
+    tn_all = _safe_sum(df["tn_all"]) if "tn_all" in df.columns else np.nan
+
     p = (tp_all / (tp_all + fp_all)) if (tp_all + fp_all) > 0 else 0.0
     r = (tp_all / (tp_all + fn_all)) if (tp_all + fn_all) > 0 else 0.0
     f1 = (2 * p * r / (p + r)) if (p + r) > 0 else 0.0
+    iou = (tp_all / (tp_all + fp_all + fn_all)) if (tp_all + fp_all + fn_all) > 0 else 0.0
+
+    if not np.isnan(tn_all) and (tp_all + fp_all + fn_all + tn_all) > 0:
+        acc = (tp_all + tn_all) / (tp_all + fp_all + fn_all + tn_all)
+        spec = (tn_all / (tn_all + fp_all)) if (tn_all + fp_all) > 0 else 0.0
+    else:
+        acc = np.nan
+        spec = np.nan
+
     micro_df = pd.DataFrame(
         [
             {
                 "TP": int(tp_all),
                 "FP": int(fp_all),
                 "FN": int(fn_all),
+                "TN": (int(tn_all) if not np.isnan(tn_all) else np.nan),
                 "Precisao": p,
                 "Recall": r,
                 "F1": f1,
+                "IoU": iou,
+                "Accuracy": acc,
+                "Specificity": spec,
             }
         ],
         index=["micro"],
     )
-    return per_class_df, micro_df
 
+    per_class_df = per_class_df.sort_values("F1", ascending=False)
+    return per_class_df, micro_df
 
 def make_rankings(df_en, img_col, class_cols, top_n):
     ranks = {}
     for c in class_cols:
-        top_count = df_en.sort_values(c, ascending=False).head(top_n)[
-            [img_col, c, "TOTAL"]
-        ]
-        top_rate = df_en.sort_values(f"rate_{c}", ascending=False).head(top_n)[
-            [img_col, f"rate_{c}", "TOTAL"]
-        ]
+        top_count = df_en.sort_values(c, ascending=False).head(top_n)[[img_col, c, "TOTAL"]]
+        top_rate = df_en.sort_values(f"rate_{c}", ascending=False).head(top_n)[[img_col, f"rate_{c}", "TOTAL"]]
         ranks[c] = {"count": top_count, "rate": top_rate}
     return ranks
-
 
 def save_enriched_csv(df_en, outdir):
     path = os.path.join(outdir, "counts_enriched.csv")
     df_en.to_csv(path, index=False)
     return path
-
 
 def save_metrics_csv(per_class_df, micro_df, outdir):
     if per_class_df is None:
@@ -205,7 +250,6 @@ def save_metrics_csv(per_class_df, micro_df, outdir):
         f.write("\n")
         micro_df.to_csv(f)
     return path
-
 
 def save_summary_md(
     summary, ranks, outdir, df_en, img_col, class_cols, per_class_df=None, micro_df=None
@@ -223,9 +267,7 @@ def save_summary_md(
     )
 
     md.append("\n## Totais por classe (micro)")
-    md.append(
-        "\n| Classe | Total | % do total | Média por imagem | Média taxa por imagem |"
-    )
+    md.append("\n| Classe | Total | % do total | Média por imagem | Média taxa por imagem |")
     md.append("\n|---|---:|---:|---:|---:|")
     for c in class_cols:
         md.append(
@@ -234,36 +276,39 @@ def save_summary_md(
         )
 
     if per_class_df is not None:
-        md.append("\n\n## Métricas agregadas (TP/FP/FN, Precisão, Recall, F1)\n")
-        md.append(
-            "> Observação: estas métricas refletem **o limiar SCORE_THR** e **o IoU** usados no script de contagem.\n"
+        md.append("\n\n## Métricas agregadas (TP/FP/FN/TN, Precisão, Recall, F1, IoU, Accuracy, Specificity)\n")
+        md.append("> Observação: métricas refletem o **limiar de score** e o **IoU** usados no script de contagem.\n")
+
+        # ---- Por classe ----
+        table_cls = per_class_df.copy()
+        if "classe" in table_cls.columns:
+            table_cls = table_cls[table_cls["classe"].str.lower() != "all"]
+
+        table_cls = _percentify(table_cls, ["Precisao","Recall","F1","IoU","Accuracy","Specificity"]).rename(
+            columns={
+                "Precisao":"Precisão (%)","Recall":"Recall (%)","F1":"F1 (%)",
+                "IoU":"IoU (%)","Accuracy":"Accuracy (%)","Specificity":"Specificity (%)",
+            }
         )
-        # tabela por classe
+        table_cls = _drop_all_nan_cols(table_cls, preserve=["classe","TP","FP","FN"])
+        sort_col = "F1 (%)" if "F1 (%)" in table_cls.columns else ("Precisão (%)" if "Precisão (%)" in table_cls.columns else None)
+        if sort_col:
+            table_cls = table_cls.sort_values(sort_col, ascending=False)
+
         md.append("\n### Por classe\n")
-        md.append(
-            per_class_df.assign(
-                Precisao=(per_class_df["Precisao"] * 100).round(2),
-                Recall=(per_class_df["Recall"] * 100).round(2),
-                F1=(per_class_df["F1"] * 100).round(2),
-            )
-            .rename(
-                columns={
-                    "Precisao": "Precisão (%)",
-                    "Recall": "Recall (%)",
-                    "F1": "F1 (%)",
-                }
-            )
-            .to_markdown(index=False)
+        md.append(table_cls.to_markdown(index=False))
+
+        # ---- Micro (global) ----
+        micro_fmt = micro_df.copy()
+        micro_fmt = _percentify(micro_fmt, ["Precisao","Recall","F1","IoU","Accuracy","Specificity"]).rename(
+            columns={
+                "Precisao":"Precisão (%)","Recall":"Recall (%)","F1":"F1 (%)",
+                "IoU":"IoU (%)","Accuracy":"Accuracy (%)","Specificity":"Specificity (%)",
+            }
         )
+        micro_fmt = _drop_all_nan_cols(micro_fmt, preserve=["TP","FP","FN"])
 
         md.append("\n\n### Micro (global)\n")
-        micro_fmt = micro_df.copy()
-        micro_fmt[["Precisao", "Recall", "F1"]] = (
-            micro_fmt[["Precisao", "Recall", "F1"]] * 100
-        ).round(2)
-        micro_fmt = micro_fmt.rename(
-            columns={"Precisao": "Precisão (%)", "Recall": "Recall (%)", "F1": "F1 (%)"}
-        )
         md.append(micro_fmt.to_markdown())
 
     for c in class_cols:
@@ -277,87 +322,56 @@ def save_summary_md(
         f.write("".join(md))
     return path
 
-
 def save_precision_md(per_class_df, micro_df, df_raw, img_col, outdir, top_n=15):
     """
-    Gera um relatório Markdown focado em Precisão.
-    - Tabela por classe: TP/FP/FN, GT (=TP+FN), Pred (=TP+FP), Precisão (%), ordenada por Precisão.
-    - Se houver colunas per-image (prec_all, tp_all, fp_all, fn_all), lista TOP-N melhores e piores imagens.
+    Relatório focado em métricas (sem TOP imagens por precisão).
+    Oculta colunas 100% NaN (ex.: TN/Accuracy/Specificity) e ignora pseudo-classe 'all'.
     """
     if per_class_df is None or per_class_df.empty:
         return None
 
-    # --- seção por classe (ordenada por precisão) ---
     tbl = per_class_df.copy()
+    if "classe" in tbl.columns:
+        tbl = tbl[tbl["classe"].str.lower() != "all"]
+
     tbl["GT"] = tbl["TP"] + tbl["FN"]
     tbl["Pred"] = tbl["TP"] + tbl["FP"]
-    tbl["Precisão (%)"] = (tbl["Precisao"] * 100).round(2)
-    tbl = tbl[["classe", "TP", "FP", "FN", "GT", "Pred", "Precisão (%)"]].sort_values(
-        "Precisão (%)", ascending=False
+
+    tbl = _percentify(tbl, ["Precisao","Recall","F1","IoU","Accuracy","Specificity"]).rename(
+        columns={
+            "Precisao":"Precisão (%)","Recall":"Recall (%)","F1":"F1 (%)",
+            "IoU":"IoU (%)","Accuracy":"Accuracy (%)","Specificity":"Specificity (%)",
+        }
     )
+    tbl = _drop_all_nan_cols(tbl, preserve=["classe","TP","FP","FN","GT","Pred"])
+
+    sort_col = "F1 (%)" if "F1 (%)" in tbl.columns else ("Precisão (%)" if "Precisão (%)" in tbl.columns else None)
+    if sort_col:
+        tbl = tbl.sort_values(sort_col, ascending=False)
 
     md = []
-    md.append("# Relatório de Precisão\n")
+    md.append("# Relatório de Precisão / Métricas\n")
+
     if micro_df is not None and not micro_df.empty:
-        p_micro = float(micro_df.loc["micro", "Precisao"]) * 100.0
-        md.append(f"- **Precisão global (micro)**: **{p_micro:.2f}%**\n")
+        micro_fmt = micro_df.copy()
+        micro_fmt = _percentify(micro_fmt, ["Precisao","Recall","F1","IoU","Accuracy","Specificity"]).rename(
+            columns={
+                "Precisao":"Precisão (%)","Recall":"Recall (%)","F1":"F1 (%)",
+                "IoU":"IoU (%)","Accuracy":"Accuracy (%)","Specificity":"Specificity (%)",
+            }
+        )
+        micro_fmt = _drop_all_nan_cols(micro_fmt, preserve=["TP","FP","FN"])
+        md.append("## Micro (global)\n")
+        md.append(micro_fmt.to_markdown())
+        md.append("\n")
 
-    md.append("\n## Precisão por classe (ordenado)\n")
+    md.append("## Por classe\n")
     md.append(tbl.to_markdown(index=False))
-
-    # --- seção por imagem (se disponível) ---
-    has_per_image = all(
-        c in df_raw.columns for c in ["prec_all", "tp_all", "fp_all", "fn_all"]
-    )
-    if has_per_image:
-        dfi = df_raw[[img_col, "prec_all", "tp_all", "fp_all", "fn_all"]].copy()
-        dfi["prec_%"] = (
-            pd.to_numeric(dfi["prec_all"], errors="coerce").fillna(0.0) * 100
-        ).round(2)
-
-        top = (
-            dfi.sort_values("prec_all", ascending=False)
-            .head(top_n)
-            .rename(
-                columns={
-                    img_col: "image",
-                    "tp_all": "TP",
-                    "fp_all": "FP",
-                    "fn_all": "FN",
-                    "prec_%": "Precisão (%)",
-                }
-            )[["image", "TP", "FP", "FN", "Precisão (%)"]]
-        )
-
-        worst = (
-            dfi.sort_values("prec_all", ascending=True)
-            .head(top_n)
-            .rename(
-                columns={
-                    img_col: "image",
-                    "tp_all": "TP",
-                    "fp_all": "FP",
-                    "fn_all": "FN",
-                    "prec_%": "Precisão (%)",
-                }
-            )[["image", "TP", "FP", "FN", "Precisão (%)"]]
-        )
-
-        md.append(f"\n\n## TOP {top_n} imagens com **maior** precisão\n")
-        md.append(top.to_markdown(index=False))
-
-        md.append(f"\n\n## TOP {top_n} imagens com **menor** precisão\n")
-        md.append(worst.to_markdown(index=False))
-    else:
-        md.append(
-            "\n\n> Observação: colunas por imagem (`prec_all`, `tp_all`, `fp_all`, `fn_all`) não foram encontradas no CSV; seção por imagem omitida.\n"
-        )
 
     path = os.path.join(outdir, "precision_report.md")
     with open(path, "w", encoding="utf-8") as f:
         f.write("".join(md))
     return path
-
 
 def make_plots(df_en, img_col, class_cols, outdir, per_class_df=None):
     totals = [int(df_en[c].sum()) for c in class_cols]
@@ -412,7 +426,6 @@ def make_plots(df_en, img_col, class_cols, outdir, per_class_df=None):
 
     return plots
 
-
 def main():
     df, img_col, class_cols, metric_class_names = load_counts(INPUT_CSV)
     df_en = enrich(df, img_col, class_cols)
@@ -441,7 +454,6 @@ def main():
         print(" - Relatório de Precisão:", precision_md)
     for p in plots:
         print(" - Figura         :", p)
-
 
 if __name__ == "__main__":
     main()

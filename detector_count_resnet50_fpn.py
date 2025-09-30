@@ -1,8 +1,14 @@
 """
 Count + metrics for Faster R-CNN (ResNet-50-FPN).
 - Gera CSV com contagens por imagem
-- (Opcional) métricas por imagem (TP/FP/FN, Precisão, Recall, F1) usando GT (COCO ou YOLO)
+- (Opcional) métricas por imagem (TP/FP/FN, Precisão, Recall, F1, IoU) usando GT (COCO ou YOLO)
 - Overlays com caixas: NEGATIVA=verde, POSITIVA=vermelho, INCERTA=amarelo
+
+Observação sobre TN/Accuracy/Specificity:
+- Para detecção por caixas (object detection), TN não é bem-definido sem um universo de "negativos" (ex.: pixels).
+- Portanto, este script NÃO cria colunas tn_* / tn_all por padrão.
+- Se você vier a ter uma fonte consistente de TN (ex.: métricas em nível de pixel/segmentação),
+  basta adicionar tn_* / tn_all aqui que o report já aproveitará para calcular Accuracy/Specificity.
 """
 
 import os, csv, json
@@ -40,31 +46,17 @@ NEG_NAMES = {"negative", "neg", "negativo", "negativa"}
 UNC_NAMES = {"uncertain", "incerta", "duvidosa"}
 
 
-def is_pos(name: str) -> bool:
-    return name.lower() in POS_NAMES
-
-
-def is_neg(name: str) -> bool:
-    return name.lower() in NEG_NAMES
-
-
-def is_unc(name: str) -> bool:
-    return name.lower() in UNC_NAMES
-
+def is_pos(name: str) -> bool: return name.lower() in POS_NAMES
+def is_neg(name: str) -> bool: return name.lower() in NEG_NAMES
+def is_unc(name: str) -> bool: return name.lower() in UNC_NAMES
 
 def color_for(name: str):
-    if is_pos(name):
-        return (255, 0, 0)
-    if is_neg(name):
-        return (0, 255, 0)
-    if is_unc(name):
-        return (255, 255, 0)
+    if is_pos(name): return (255, 0, 0)
+    if is_neg(name): return (0, 255, 0)
+    if is_unc(name): return (255, 255, 0)
     return (0, 255, 255)
 
-
-def safe_div(n, d):
-    return (n / d) if d else 0.0
-
+def safe_div(n, d): return (n / d) if d else 0.0
 
 def box_iou_xyxy(a, b):
     ax1, ay1, ax2, ay2 = a
@@ -78,8 +70,11 @@ def box_iou_xyxy(a, b):
     union = a_area + b_area - inter
     return inter / union if union > 0 else 0.0
 
-
 def greedy_match(pred_boxes, pred_scores, gt_boxes, iou_thr):
+    """
+    Greedy matching por score (padronizado para detecção):
+    retorna TP/FP/FN; IoU agregado é calculado à parte como TP/(TP+FP+FN).
+    """
     gt_used = [False] * len(gt_boxes)
     tp = 0
     for i in sorted(range(len(pred_boxes)), key=lambda k: pred_scores[k], reverse=True):
@@ -204,7 +199,7 @@ def main():
     files.sort()
 
     rows = []
-    agg_metrics = {"_all": {"TP": 0, "FP": 0, "FN": 0}}
+    agg_metrics = {"_all": {"TP": 0, "FP": 0, "FN": 0}}  # manter simples; TN não é incluído aqui
     for fname in files:
         path = os.path.join(IMG_DIR, fname)
         img = Image.open(path).convert("RGB")
@@ -243,7 +238,6 @@ def main():
                 pred_by_c[n].append(b)
                 score_by_c[n].append(s)
 
-            # calcula TP/FP/FN por classe
             for cname in set(list(gt_by_c.keys()) + list(pred_by_c.keys())):
                 tp, fp, fn = greedy_match(
                     pred_by_c[cname], score_by_c[cname], gt_by_c[cname], IOU_THR
@@ -251,6 +245,8 @@ def main():
                 prec = safe_div(tp, tp + fp)
                 rec = safe_div(tp, tp + fn)
                 f1 = safe_div(2 * prec * rec, prec + rec) if (prec + rec) else 0.0
+                iou = safe_div(tp, tp + fp + fn)
+
                 per_img_metrics[cname] = {
                     "TP": tp,
                     "FP": fp,
@@ -258,6 +254,7 @@ def main():
                     "P": prec,
                     "R": rec,
                     "F1": f1,
+                    "IoU": iou,
                 }
 
                 agg = agg_metrics.setdefault(cname, {"TP": 0, "FP": 0, "FN": 0})
@@ -277,14 +274,16 @@ def main():
                 row[f"prec_{cname}"] = round(m["P"], 4)
                 row[f"rec_{cname}"] = round(m["R"], 4)
                 row[f"f1_{cname}"] = round(m["F1"], 4)
+                row[f"iou_{cname}"] = round(m["IoU"], 4)
+
             tp_img = sum(m["TP"] for m in per_img_metrics.values())
             fp_img = sum(m["FP"] for m in per_img_metrics.values())
             fn_img = sum(m["FN"] for m in per_img_metrics.values())
             p_img = safe_div(tp_img, tp_img + fp_img)
             r_img = safe_div(tp_img, tp_img + fn_img)
-            f1_img = (
-                safe_div(2 * p_img * r_img, p_img + r_img) if (p_img + r_img) else 0.0
-            )
+            f1_img = safe_div(2 * p_img * r_img, p_img + r_img) if (p_img + r_img) else 0.0
+            iou_img = safe_div(tp_img, tp_img + fp_img + fn_img)
+
             row.update(
                 {
                     "tp_all": tp_img,
@@ -293,20 +292,18 @@ def main():
                     "prec_all": round(p_img, 4),
                     "rec_all": round(r_img, 4),
                     "f1_all": round(f1_img, 4),
+                    "iou_all": round(iou_img, 4),
                 }
             )
+
         rows.append(row)
 
         if SAVE_DEBUG_OVERLAY:
             vis = img.copy()
-            vis = draw_boxes(
-                vis, boxes, labels, scores, thr=SCORE_THR, idx_to_name=None
-            )
+            vis = draw_boxes(vis, boxes, labels, scores, thr=SCORE_THR, idx_to_name=None)
             vis.save(os.path.join(OUT_DEBUG_DIR, f"det_{fname}"))
 
-    fieldnames = sorted(
-        {k for r in rows for k in r.keys()}, key=lambda x: (x != "image", x)
-    )
+    fieldnames = sorted({k for r in rows for k in r.keys()}, key=lambda x: (x != "image", x))
     with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -314,14 +311,14 @@ def main():
             w.writerow(r)
     print("CSV salvo em:", OUT_CSV)
 
-    # resumo agregado (JSON)
     if METRICS["ENABLED"]:
 
         def pack(tp, fp, fn):
             p = safe_div(tp, tp + fp)
             r = safe_div(tp, tp + fn)
             f1 = safe_div(2 * p * r, p + r) if (p + r) else 0.0
-            return {"TP": tp, "FP": fp, "FN": fn, "P": p, "R": r, "F1": f1}
+            iou = safe_div(tp, tp + fp + fn)
+            return {"TP": tp, "FP": fp, "FN": fn, "P": p, "R": r, "F1": f1, "IoU": iou}
 
         summary = {"iou_thr": METRICS["IOU_THR"], "per_class": {}, "micro": {}}
         for cname, m in agg_metrics.items():
